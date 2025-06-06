@@ -108,5 +108,5 @@ Trigger Mirai 的愿景不仅限于“文件名清洗”，而是构建一套以
 
 ---
 
-> Trigger Mirai —— This is the tag filter system, from the future.
-把动漫库，从“硬盘混沌”变成“像样展柜”。
+Trigger Mirai —— 未来并非虚无，只是尚未被触发。
+
