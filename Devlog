@@ -1,0 +1,260 @@
+开发日志：番剧元数据自动化匹配工具
+
+一、项目背景与目标
+背景
+在 Jellyfin、Emby 等影音中心使用过程中，希望能够为本地存储的番剧文件自动补全详细的剧情信息、集数标题、放送日期等元数据，而不必手动在网络上搜索。市面上已有工具（如 Shoko、Plex 插件等）可实现一定程度的自动化，但由于中文用户群体多来自“Comicat”下载站，文件命名格式混乱，对现有工具支持不友好，往往需要手动改名或补全信息，极为繁琐。
+
+核心目标
+
+批量扫描本地番剧文件夹/文件，提取核心番名、季数和集数。
+
+调用公开 API（Bangumi v0 / 分季条目 + AniList 等），获取标准化的番剧信息（名称、中英/日文、ID）。
+
+针对每集，通过 Bangumi 详细接口获取“集标题”、“首播日期”、“时长”、“摘要”等。
+
+以 JSON（或 nfo）等格式输出，便于 Jellyfin 等媒体中心直接读取并展示。
+
+二、开发过程与关键里程碑
+1. 初始思路：Comicat → Bangumi 对照
+想法：
+直接用 Comicat 上的磁链或文件夹名爬取数据，并对比 Bangumi 目录。
+
+挑战：
+
+Comicat 网站混乱，缺少统一 API。高访问量会被封禁；
+
+需要先搭建对 Comicat 的爬虫或通过 Jackett，调试成本高；
+
+文件夹名、字幕组、清晰度信息过多，难以直接拿关键词。
+
+2. 第一版脚本：文件名净化 + Bangumi v0 /search/subjects
+实现：
+
+编写 Python 脚本，扫描本地一级子目录（假设每个目录代表一个番剧季）。
+
+用正则净化目录名（去掉 [BDrip]、[LoliHouse]、1080p、x265、S02 等干扰信息），提取核心关键词作为搜索 Bangumi 的输入。
+
+调用 POST /v0/search/subjects 接口（带 "filter": {"type":[2]}），得到第 1 条匹配，并输出 name、name_cn 及 id。
+
+问题：
+
+最初使用 GET /v0/search/subject/{keyword}，结果 404，发现官方文档已弃用该路径；
+
+filter.type 当时写成整型 2 而不是数组 [2]，导致 400 错误；
+
+Token 缺失或格式不对导致失败。
+
+优化：
+
+将搜索改为 POST /v0/search/subjects，并把 filter.type 修改为数组 [2]；
+
+在请求头中加入用户的 “Bearer Token” 与 User-Agent；
+
+修正代码后能够正确返回匹配结果。
+
+最终成果：
+结构化输出如：
+
+json
+复制
+编辑
+{
+  "[BDrip] Kage no Jitsuryokusha ni Naritakute S02 […]": {
+    "matched_name": "陰の実力者になりたくて！",
+    "matched_cn": "想要成为影之实力者！",
+    "bangumi_id": 329114
+  },
+  "[LoliHouse] Kage no Jitsuryokusha ni Naritakute! […]": {
+    "matched_name": "陰の実力者になりたくて！",
+    "matched_cn": "想要成为影之实力者！",
+    "bangumi_id": 329114
+  }
+}
+3. 二轮迭代：兼容 AniList 或 AniDB 日文名
+思路：
+有些英文罗马音在 Bangumi 上不易检索，改用 AniList API 或 AniDB 网页爬虫先拿日文原名，再去 Bangumi 搜索。
+
+AniList 方案：
+
+用 GraphQL 请求 Media(search: title, type: ANIME)，直接拿到 title.native、title.romaji、title.english；
+
+拿到后按“日文→英文→ROMAJI”优先顺序依次查询 POST /v0/search/subjects。
+
+AniDB 方案：
+
+爬 AniDB 网页先获取日文名（平假名/片假名/汉字），同样用来提高 Bangumi 匹配率。
+
+挑战：
+
+AniDB 网页结构多变，需要维护；
+
+AniList 请求成功率高，但 GraphQL 入门门槛稍高；
+
+接口链路变得冗长，效率略低。
+
+结论：
+最终决定精简，仅用本地净化版关键词 + Bangumi API 已可满足绝大多数情况；AniList 作为可选兜底。
+
+4. 集数匹配：从文件名提取季数+集数 → Bangumi /episodes
+思路：
+
+文件名示例：
+
+css
+复制
+编辑
+Kage no Jitsuryokusha ni Naritakute S02E01-[1080p][BDRIP][x265.FLAC].mkv
+先用正则 r"S(\d+)E(\d+)" 提取出“第2季第1集”（即 season=2, episode=1）；
+
+Bangumi 中，“每季”是独立 Subject，直接用上一步得到的 bangumi_id（329114）对对应季条目；
+
+早期尝试 GET /v0/subjects/{id}/episodes 失败（404），文档发现该接口并不存在；
+
+后改用 GET /v0/subjects/{id} 拿到返回 JSON 中的 eps（大概率只是整数集数），无详细列表；
+
+最终确定需调用 GET /v0/episodes?subject_id={id} 来获取该条目下的所有集信息；
+
+遍历返回的数组（键名 data），找到 ep["sort"] == episode_num 的条目，拿到该集 episode_id；
+
+再调用 GET /v0/episodes/{episode_id} 拿详细 fields，如 name、summary、airdate、duration 等。
+
+示例代码：
+
+python
+复制
+编辑
+# 提取季数&集数
+match = re.search(r"[Ss](\d+)[Ee](\d+)", filename)
+season, ep_no = int(match.group(1)), int(match.group(2))
+
+# 先查 subject：拿到 eps_count 或 eps 列表（如果有）
+subj = requests.get(f"https://api.bgm.tv/v0/subjects/{season_subject_id}", headers=headers).json()
+# 然后查 episodes 列表
+resp = requests.get("https://api.bgm.tv/v0/episodes", params={"subject_id": season_subject_id}, headers=headers)
+episodes_list = resp.json().get("data", [])
+
+# 在列表中找 ep["sort"] == ep_no
+for ep in episodes_list:
+    if ep["sort"] == ep_no:
+        ep_id = ep["id"]
+        break
+
+# 再拿详细信息
+ep_detail = requests.get(f"https://api.bgm.tv/v0/episodes/{ep_id}", headers=headers).json()
+print(ep_detail["name"], ep_detail["airdate"], ep_detail["duration"])
+5. 最终脚本实现与验证
+功能覆盖
+
+目录级匹配：自动净化目录名、搜索 Bangumi、得到 bangumi_id。
+
+集数级匹配：从文件名里提取 season/episode → 查询该季所有 episodes → 精确拿到当前文件的集标题、放送日期、时长、摘要。
+
+输出：
+
+JSON：存储每个文件（或每个文件夹）对应的元数据信息（包括 Bangumi ID、集数标题、airdate、duration、summary）。
+
+后续可扩展为 NFO/XML 供 Jellyfin 直接读取。
+
+已完成示例
+
+对 E:\anime\[LoliHouse] Kage no Jitsuryokusha ni Naritakute! [...] 目录下的 S02E01-…mkv 成功提取到：
+
+css
+复制
+编辑
+集标题： 無法都市  
+首播时间： 2023-10-04  
+时长： 24 minutes  
+简介： Cid and his sister Claire venture to the huge slum […]
+三、当前成果与后续规划
+1. 当前成果
+step1.py（番剧级匹配）
+
+自动净化目录名，并调用 Bangumi v0 API 完成“目录→bangumi_id”映射。
+
+JSON 输出示例：
+
+json
+复制
+编辑
+{
+  "[BDrip] Kage no Jitsuryokusha ni Naritakute S02 […]": {
+    "matched_name": "陰の実力者になりたくて！",
+    "matched_cn": "想要成为影之实力者！",
+    "bangumi_id": 329114
+  }
+}
+step2.py（集数级匹配）
+
+从示例文件名（S02E01-…mkv）提取 season=2、episode=1。
+
+对应 'subject_id'=329114，通过 /v0/episodes?subject_id=329114 拿整个季集列表。
+
+匹配到 sort=1，获取该集的详细信息。
+
+打印示例：
+
+yaml
+复制
+编辑
+集标题： 無法都市
+首播时间： 2023-10-04
+时长： 24 minutes
+2. 项目总结与经验教训
+API 文档多变：
+
+Bangumi 曾有旧的 /search/subject/{keyword}、/subjects/{id}/episodes，实际未被维护或已弃用。
+
+必须以最新文档（OAS 3.0）为准：POST /v0/search/subjects、GET /v0/episodes 等。
+
+Token/鉴权要点：
+
+只洗关键词并调用公开接口，若忘记加 Bearer <token>，往往会出现 400/403 错误。
+
+filter.type 需传数组 [2]，否则请求参数格式不符合 OAS，直接 400。
+
+条目（Season）与集（Episode）的映射：
+
+Bangumi 把每季当成一个独立 Subject，必须针对不同季维护不同 subject_id。
+
+Subject 下的 eps 字段通常只是整季总集数，而详细集列表要用 /v0/episodes?subject_id= 来获取。
+
+文件名格式多样性：
+
+Comicat、BDrip、LoliHouse 等订阅组往往有各自命名规则，需要写足够灵活的正则去净化。
+
+常见提取：SxxExx、EPxx、[xx]、分辨率、编码信息均可先行剔除再用正则精准抓 S\d+E\d+。
+
+3. 后续功能与优化规划
+批量处理文件夹 + 生成全局 JSON
+
+扫描指定根目录下所有季文件夹 → 对应多个 subject_id → 统一输出合集 JSON，方便一次性导入 Jellyfin。
+
+自动下载封面与海报
+
+通过 /v0/subjects/{id}/image 接口获取条目封面 → 存为 folder.jpg 或 poster.jpg。
+
+生成 nfo/XML 格式
+
+将每集信息写入 S02E01.nfo、tvshow.nfo 等标准格式，直接贴到 Jellyfin 库目录即可被识别。
+
+GUI 或 CLI 参数化
+
+增加可选项：指定 --season-id、--output-format=[json|nfo]、--skip-existing 等。
+
+中文/日文/英文混合匹配
+
+若纯净关键词无法命中，可加入 AniList 兜底、或提供本地「番名 → Bangumi ID」映射字典。
+
+Docker/打包分发
+
+将脚本打包为可独立运行的 .exe 或 Docker 容器，方便其他用户部署。
+
+四、结语
+截至目前，我们已经完成了番剧目录级与集数级的自动匹配与元数据提取：
+
+不依赖 Comicat 爬虫，直接用 Bangumi 最新公开 API（/v0/search/subjects + /v0/episodes）即可实现高准确率匹配。
+
+对文件名中复杂的字幕组、编码、清晰度等噪声能够精确净化，提取出有效关键词。
+
+支持多季（不同 subject_id）以及多种集数命名方式（SxxExx）匹配。
